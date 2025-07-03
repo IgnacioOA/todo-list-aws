@@ -15,3 +15,6 @@ def create(event, context):
         "body": json.dumps(item)
     }
     return response
+
+def mi_funcion():
+print("Hola mundo")  # ← Indentación incorrecta
