@@ -104,8 +104,11 @@ pipeline {
                         git checkout develop
                         git pull origin develop
         
-                        echo "Hago un checkout de master y actualizamos"
-                        git checkout master
+                        echo "Me aseguro de tener la rama master desde el remoto"
+                        git fetch origin
+        
+                        echo "Hago un checkout de master (creándola si no existe localmente)"
+                        git checkout master || git checkout -b master origin/master
                         git pull origin master
         
                         echo "Mergeo develop en master (excluyendo JENKINSFILE y JENKINSFILEAGENTES)"
@@ -117,6 +120,5 @@ pipeline {
                 }
             }
         }
-
     }
 }
