@@ -1,0 +1,66 @@
+pipeline {
+    agent none
+
+    stages {
+        stage('Get Code') {
+            agent { label 'principal' }
+            steps {
+                sh 'echo "Usuario actual: $(whoami)"; echo "Hostname actual: $(hostname)"'
+                echo 'Me voy a traer el código de la rama master del GitHub de IgnacioOA'
+                git branch: 'master', url: 'https://github.com/IgnacioOA/todo-list-aws.git'
+                sh 'ls -la'
+                echo "${WORKSPACE}"
+                stash name: 'source-code', includes: '**/*'
+            }
+        }
+
+        stage('deploy') {
+            agent { label 'agent2' }
+            steps {
+                unstash 'source-code'
+                catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                    echo 'Construyo los recursos con SAM'
+                    sh 'sam build'
+
+                    echo 'Validamos el template'
+                    sh 'sam validate --region us-east-1'
+
+                    echo 'Desplegamos los recursos con SAM'
+                    sh '''
+                        sam deploy \
+                            --stack-name todo-list-aws-production \
+                            --s3-bucket test-ioa-p25-production \
+                            --capabilities CAPABILITY_IAM \
+                            --region us-east-1 \
+                            --parameter-overrides Stage=production \
+                            --no-confirm-changeset \
+                            --no-fail-on-empty-changeset
+                    '''
+                }
+            }
+        }
+
+        stage('Test') {
+            agent { label 'agent3' }
+            steps {
+                unstash 'source-code'
+                script {
+                    def apiUrl = sh(
+                        script: "aws cloudformation describe-stacks --stack-name todo-list-aws-production --region us-east-1 --query \"Stacks[0].Outputs[?OutputKey=='BaseUrlApi'].OutputValue\" --output text",
+                        returnStdout: true
+                    ).trim()
+
+                    echo "Probamos con la ${apiUrl}"
+
+                    withEnv(["BASE_URL=${apiUrl}"]) {
+                        sh """
+                            export PYTHONPATH=$WORKSPACE
+                            pytest --junitxml=result-rest.xml test/integration/todoApiTest.py
+                        """
+                    }
+                }
+                junit 'result-rest.xml'
+            }
+        }
+    }
+}
