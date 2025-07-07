@@ -1,0 +1,137 @@
+pipeline {
+    agent none
+
+    stages {
+        stage('Get Code') {
+            agent { label 'principal' }
+            steps {
+                sh 'echo "Usuario actual: $(whoami)"; echo "Hostname actual: $(hostname)"'
+                echo 'Me voy a traer el código de la rama develop del GitHub de IgnacioOA'
+                git branch: 'develop', url: 'https://github.com/IgnacioOA/todo-list-aws.git'
+                sh 'ls -la'
+                echo "${WORKSPACE}"
+                stash name: 'source-code', includes: '**/*'
+            }
+        }
+        
+        
+        stage('Flake8-Bandit'){ //CREO UNA PARALELIZACION CON STATIC FLAKE8 Y BANDIT
+            parallel{
+                stage('static') {
+                    sh 'echo "Usuario actual: $(whoami)"; echo "Hostname actual: $(hostname)"'
+                    agent { label 'agent2' }
+                    steps {
+                        unstash 'source-code'
+                        catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                            sh '''
+                                echo "[FLAKE8]Entramos a los archivos que va a analizar:"
+                                find src -name "*.py"
+                                
+                                flake8 --exit-zero --format=pylint $(find src -name "*.py") > flake8.out
+                            '''
+                            recordIssues tools: [flake8(name: 'Flake8', pattern: 'flake8.out')],
+                                qualityGates: [[threshold: 10, type: 'TOTAL', unstable: true],
+                                               [threshold: 11, type: 'TOTAL', unstable: false]]
+                        }
+                    }
+                }//end static
+        
+                stage('security') {
+                    agent { label 'agent2' }
+                    steps {
+                        unstash 'source-code'
+                        catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                            sh '''
+                                echo "[BANDIT]Entramos a los archivos que va a analizar:"
+                                find src -name "*.py"
+                                
+                                bandit --exit-zero -r src -f custom -o bandit.out --msg-template "{abspath}:{line}: [{test_id}] {msg}"
+                            '''
+                            recordIssues tools: [pyLint(name: 'Bandit', pattern: 'bandit.out')],
+                                qualityGates: [[threshold: 3, type: 'TOTAL', unstable: true],
+                                               [threshold: 3, type: 'TOTAL', unstable: false]]
+                        }
+                    }
+                }// end security
+            }
+        }
+
+        stage('deploy') {
+            agent { label 'principal' }
+            steps {
+                unstash 'source-code'
+                catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                    echo 'Construyo los recursos con SAM'
+                    sh 'sam build'
+
+                    echo 'Validamos el template'
+                    sh 'sam validate'
+
+                    echo 'Desplegamos los recursos con SAM'
+                    sh '''
+                        sam deploy \
+                            --stack-name todo-list-aws-staging \
+                            --s3-bucket test-ioa-p25 \
+                            --capabilities CAPABILITY_IAM \
+                            --region us-east-1 \
+                            --parameter-overrides Stage=staging \
+                            --no-confirm-changeset \
+                            --no-fail-on-empty-changeset
+                    '''
+                }
+            }
+        }
+
+        stage('Test') {
+            agent { label 'agent3' }
+            steps {
+                unstash 'source-code'
+                script {
+                    def apiUrl = sh(
+                        script: "aws cloudformation describe-stacks --stack-name todo-list-aws-staging --region us-east-1 --query \"Stacks[0].Outputs[?OutputKey=='BaseUrlApi'].OutputValue\" --output text",
+                        returnStdout: true
+                    ).trim()
+
+                    echo "Probamos con la ${apiUrl}"
+
+                    withEnv(["BASE_URL=${apiUrl}"]) {
+                        sh """
+                            export PYTHONPATH=$WORKSPACE
+                            pytest --junitxml=result-rest.xml test/integration/todoApiTest.py
+                        """
+                    }
+                }
+                junit 'result-rest.xml'
+            }
+        }
+        
+        stage('Promote') {
+            agent { label 'principal' }
+            steps {
+                withCredentials([string(credentialsId: 'token', variable: 'TOKEN')]) {
+                    sh '''
+                        echo "Configuro estrategia de merge para archivos específicos"
+                        git config merge.ours.driver true
+        
+                        echo "Hago un checkout de develop y actualizamos"
+                        git checkout develop
+                        git pull origin develop
+        
+                        echo "Me aseguro de tener la rama master desde el remoto"
+                        git fetch origin
+        
+                        echo "Hago un checkout de master (creándola si no existe localmente)"
+                        git checkout master || git checkout -b master origin/master
+                        git pull origin master
+        
+                        echo "Mergeo develop en master (excluyendo JENKINSFILE y JENKINSFILEAGENTES)"
+                        git merge develop
+        
+                        echo "Hago un Push a master con token de Jenkins"
+                        git push https://IgnacioOA:$TOKEN@github.com/IgnacioOA/todo-list-aws.git master
+                    '''
+                }
+            }
+        }
+    }
+}
