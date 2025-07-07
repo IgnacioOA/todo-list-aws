@@ -1,0 +1,141 @@
+pipeline {
+    agent any
+
+    parameters {
+        string(name: 'ENV', defaultValue: 'staging', description: 'Nombre del entorno a usar (staging, prod, etc)')
+    }
+
+    stages {
+        
+        stage('Get Code') {
+            steps {
+                sh 'echo "Usuario actual: $(whoami)"; echo "Hostname actual: $(hostname)"'
+        
+                echo 'Clonando el repositorio principal (todo-list-aws)'
+                git branch: 'develop', url: 'https://github.com/IgnacioOA/todo-list-aws.git'
+                echo "Repositorio principal clonado en: ${WORKSPACE}"
+                
+                echo 'Clonando el repositorio de configuración (todo-list-aws-config) en /config'
+                dir('config') {
+                    git branch: "${params.ENV}" , url: 'https://github.com/IgnacioOA/todo-list-aws-config.git'
+                }
+        
+                echo 'Copiando samconfig.toml al workspace raíz'
+                sh 'cp config/samconfig.toml .'
+        
+                echo 'Contenido de samconfig.toml:'
+                sh 'cat samconfig.toml'
+        
+                stash name: 'source-code', includes: '**/*'
+            }
+        }
+
+        stage('static') {
+            steps {
+                catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                    sh '''
+                        echo "[FLAKE8] Entramos a los archivos que va a analizar:"
+                        find src -name "*.py"
+                        flake8 --exit-zero --format=pylint $(find src -name "*.py") > flake8.out
+                    '''
+                    recordIssues tools: [flake8(name: 'Flake8', pattern: 'flake8.out')],
+                        qualityGates: [[threshold: 10, type: 'TOTAL', unstable: true],
+                                       [threshold: 11, type: 'TOTAL', unstable: false]]
+                }
+            }
+        }
+
+        stage('security') {
+            steps {
+                catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                    sh '''
+                        echo "[BANDIT] Entramos a los archivos que va a analizar:"
+                        find src -name "*.py"
+                        bandit --exit-zero -r src -f custom -o bandit.out --msg-template "{abspath}:{line}: [{test_id}] {msg}"
+                    '''
+                    recordIssues tools: [pyLint(name: 'Bandit', pattern: 'bandit.out')],
+                        qualityGates: [[threshold: 3, type: 'TOTAL', unstable: true],
+                                       [threshold: 3, type: 'TOTAL', unstable: false]]
+                }
+            }
+        }
+
+        stage('deploy') {
+            steps {
+                script {
+                    echo 'Construyo los recursos con SAM'
+                    sh 'sam build'
+        
+                    echo 'Validamos el template'
+                    sh 'sam validate --region us-east-1'
+        
+                    echo "Desplegamos los recursos con SAM para el entorno: ${params.ENV}"
+                    
+                    // Ejecuta sam deploy, captura salida y status
+                    def deployStatus = sh(script: "sam deploy --config-env ${params.ENV} 2>&1 | tee deploy.log", returnStatus: true)
+                    def deployOutput = readFile('deploy.log')
+        
+                    if (deployOutput.contains('No changes to deploy')) {
+                        echo '[INFO] No hay cambios para desplegar, continuando sin error.'
+                    } else if (deployStatus != 0) {
+                        error "[ERROR] Falló el despliegue:\n${deployOutput}"
+                    } else {
+                        echo '[INFO] Despliegue completado correctamente.'
+                    }
+                }
+            }
+        }
+        
+        stage('Test') {
+            steps {
+                script {
+                    def stackName = "todo-list-aws-${params.ENV}"
+                    def apiUrl = sh(
+                        script: "aws cloudformation describe-stacks --stack-name ${stackName} --region us-east-1 --query \"Stacks[0].Outputs[?OutputKey=='BaseUrlApi'].OutputValue\" --output text",
+                        returnStdout: true
+                    ).trim()
+        
+                    echo "Probamos con la URL: ${apiUrl}"
+        
+                    withEnv(["BASE_URL=${apiUrl}"]) {
+                        sh """
+                            export PYTHONPATH=$WORKSPACE
+                            pytest --junitxml=result-rest.xml test/integration/todoApiTest.py
+                        """
+                    }
+                }
+                junit 'result-rest.xml'
+            }
+        }
+        
+         stage('Promote') {
+            steps {
+                unstash 'source-code'
+                //recojo el token de jenkins
+                withCredentials([string(credentialsId: 'token', variable: 'TOKEN')]) {
+                    sh '''
+                        
+                        echo "Hago un rebase"
+                        git config --global pull.rebase false
+        
+                        echo "Hago un checkout de develop y actualizamos"
+                        git checkout develop
+                        git pull origin develop
+        
+                        echo "Hago un checkout de master y actualizamos"
+                        git checkout master
+                        git pull origin master
+        
+                        echo "Mergeo las ramas"
+                        git merge develop
+        
+                        echo "Hago un Push a master con token de Jenkins"
+                        git push https://IgnacioOA:$TOKEN@github.com/IgnacioOA/todo-list-aws.git master
+                    '''
+                }
+            }
+        }
+        
+        
+    }
+}
