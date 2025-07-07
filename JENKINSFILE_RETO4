@@ -1,0 +1,81 @@
+pipeline {
+    agent any
+
+    parameters {
+        string(name: 'ENV', defaultValue: 'staging', description: 'Nombre del entorno a usar (staging, prod, etc)')
+    }
+
+    stages {
+        
+        stage('Get Code') {
+            steps {
+                sh 'echo "Usuario actual: $(whoami)"; echo "Hostname actual: $(hostname)"'
+        
+                echo 'Clonando el repositorio principal (todo-list-aws)'
+                git branch: 'master', url: 'https://github.com/IgnacioOA/todo-list-aws.git'
+                echo "Repositorio principal clonado en: ${WORKSPACE}"
+                
+                echo 'Clonando el repositorio de configuración (todo-list-aws-config) en /config'
+                dir('config') {
+                    git branch: "${params.ENV}" , url: 'https://github.com/IgnacioOA/todo-list-aws-config.git'
+                }
+        
+                echo 'Copiando samconfig.toml al workspace raíz'
+                sh 'cp config/samconfig.toml .'
+        
+                echo 'Contenido de samconfig.toml:'
+                sh 'cat samconfig.toml'
+        
+                stash name: 'source-code', includes: '**/*'
+            }
+        }
+
+        stage('deploy') {
+            steps {
+                script {
+                    echo 'Construyo los recursos con SAM'
+                    sh 'sam build'
+        
+                    echo 'Validamos el template'
+                    sh 'sam validate --region us-east-1'
+        
+                    echo "Desplegamos los recursos con SAM para el entorno: ${params.ENV}"
+                    
+                    // Ejecuta sam deploy, captura salida y status
+                    def deployStatus = sh(script: "sam deploy --config-env ${params.ENV} 2>&1 | tee deploy.log", returnStatus: true)
+                    def deployOutput = readFile('deploy.log')
+        
+                    if (deployOutput.contains('No changes to deploy')) {
+                        echo '[INFO] No hay cambios para desplegar, continuando sin error.'
+                    } else if (deployStatus != 0) {
+                        error "[ERROR] Falló el despliegue:\n${deployOutput}"
+                    } else {
+                        echo '[INFO] Despliegue completado correctamente.'
+                    }
+                }
+            }
+        }
+        
+        stage('Test') {
+            steps {
+                script {
+                    def stackName = "todo-list-aws-${params.ENV}"
+                    def apiUrl = sh(
+                        script: "aws cloudformation describe-stacks --stack-name ${stackName} --region us-east-1 --query \"Stacks[0].Outputs[?OutputKey=='BaseUrlApi'].OutputValue\" --output text",
+                        returnStdout: true
+                    ).trim()
+        
+                    echo "Probamos con la URL: ${apiUrl}"
+        
+                    withEnv(["BASE_URL=${apiUrl}"]) {
+                        sh """
+                            export PYTHONPATH=$WORKSPACE
+                            pytest --junitxml=result-rest.xml test/integration/todoApiTest.py
+                        """
+                    }
+                }
+                junit 'result-rest.xml'
+            }
+        }
+    }
+}
